@@ -384,6 +384,13 @@ def main():
     poll_counter = 0
     fallback_check_interval = 10  # Re-check fallback every 10 polls when docked
 
+    # Periodic USB session refresh: defends against stale status reads when the
+    # dongle sits behind autosuspending hubs (e.g. the CalDigit TS4 dock, where
+    # an upstream hub suspending freezes get_headset_status() on its last value
+    # with no error). The udev rule pins hub power; this is the backstop.
+    reconnect_counter = 0
+    reconnect_interval = 120  # force a fresh USB session every ~120 polls
+
     def switch_to_fallback():
         """Switch both sink and source to fallback devices."""
         nonlocal last_fallback_sink, last_fallback_source
@@ -423,6 +430,25 @@ def main():
                 time.sleep(backoff_seconds)
                 # Increase backoff for next attempt (capped at max)
                 backoff_seconds = min(backoff_seconds * 2, max_backoff)
+                continue
+
+        # === Periodic USB session refresh (defensive against stale reads) ===
+        # Re-open the USB session every reconnect_interval polls so a frozen
+        # status endpoint (from an upstream hub autosuspending) can't silently
+        # stall dock/undock detection. last_status is deliberately preserved so
+        # a refresh never re-asserts audio routing over a manual sink choice.
+        reconnect_counter += 1
+        if reconnect_counter >= reconnect_interval:
+            reconnect_counter = 0
+            try:
+                device.close()
+            except Exception:
+                pass
+            device = try_connect_device()
+            if device is None:
+                print("Periodic refresh: dock unreachable, retrying", flush=True)
+                last_status = None
+                time.sleep(backoff_seconds)
                 continue
 
         # === STATE: Connected ===
