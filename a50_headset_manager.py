@@ -29,6 +29,38 @@ from eh_fifty import Device, DeviceNotConnected
 HEADSET_SINK = "alsa_output.usb-Astro_Gaming_Astro_A50-00.stereo-game"
 HEADSET_SOURCE = "alsa_input.usb-Astro_Gaming_Astro_A50-00.mono-chat"
 
+# Hard cap on every external audio-tool call (pactl/pw-cli/wpctl). Without this,
+# a wedged PipeWire graph -- e.g. the A50 dropping its PCM endpoints and leaving
+# object enumeration stuck -- freezes the call indefinitely, and the whole
+# monitor loop blocks with it (observed: pw-cli hung for minutes). On timeout we
+# log and return None so the loop keeps polling and recovers on its own.
+SUBPROCESS_TIMEOUT = 5  # seconds
+
+
+def run_audio_cmd(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess | None:
+    """Run an external audio command with a hard timeout.
+
+    Returns the CompletedProcess on success, or None if the command timed out,
+    the tool was missing, or (when check=True) it exited non-zero. Callers treat
+    None as "no data / switch failed" and retry on the next poll rather than
+    blocking forever on an unresponsive PipeWire.
+    """
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True, text=True,
+            timeout=SUBPROCESS_TIMEOUT, check=check,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"Timeout after {SUBPROCESS_TIMEOUT}s: {' '.join(cmd)}", flush=True)
+        return None
+    except subprocess.CalledProcessError as e:
+        print(f"Command failed ({e.returncode}): {' '.join(cmd)}", flush=True)
+        return None
+    except FileNotFoundError:
+        print(f"Command not found: {cmd[0]}", flush=True)
+        return None
+
 
 @dataclass
 class SinkInfo:
@@ -72,10 +104,9 @@ def get_sinks_with_port_availability() -> list[SinkInfo]:
 
     Returns a list of SinkInfo objects with availability status.
     """
-    result = subprocess.run(
-        ["pactl", "list", "sinks"],
-        capture_output=True, text=True
-    )
+    result = run_audio_cmd(["pactl", "list", "sinks"])
+    if result is None:
+        return []
 
     sinks = []
     current_name = None
@@ -203,10 +234,9 @@ def get_sources() -> list[SourceInfo]:
 
     Returns a list of SourceInfo objects.
     """
-    result = subprocess.run(
-        ["pactl", "list", "sources"],
-        capture_output=True, text=True
-    )
+    result = run_audio_cmd(["pactl", "list", "sources"])
+    if result is None:
+        return []
 
     sources = []
     current_name = None
@@ -268,10 +298,9 @@ def get_best_fallback_source() -> str | None:
 
 def get_node_id(node_name: str) -> str | None:
     """Look up PipeWire node ID by name."""
-    result = subprocess.run(
-        ["pw-cli", "ls", "Node"],
-        capture_output=True, text=True
-    )
+    result = run_audio_cmd(["pw-cli", "ls", "Node"])
+    if result is None:
+        return None
     current_id = None
     for line in result.stdout.splitlines():
         if line.startswith("\tid"):
@@ -285,7 +314,8 @@ def set_default_sink(node_name: str) -> bool:
     """Set default audio sink by name."""
     node_id = get_node_id(node_name)
     if node_id:
-        subprocess.run(["wpctl", "set-default", node_id], check=True)
+        if run_audio_cmd(["wpctl", "set-default", node_id], check=True) is None:
+            return False
         return True
     return False
 
@@ -294,7 +324,8 @@ def set_default_source(node_name: str) -> bool:
     """Set default audio source by name."""
     node_id = get_node_id(node_name)
     if node_id:
-        subprocess.run(["wpctl", "set-default", node_id], check=True)
+        if run_audio_cmd(["wpctl", "set-default", node_id], check=True) is None:
+            return False
         return True
     return False
 
