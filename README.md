@@ -108,6 +108,51 @@ a50-headset-manager
 2. Internal microphone array
 3. External microphone input
 
+## Recovery
+
+If a switch fails (for example, PipeWire is slow or the output is not
+available yet), the daemon tries again. The output and the input are
+retried separately, so only the part that failed is set again. The first
+retry is after 2 seconds, and the wait doubles after each failure, up to
+60 seconds. After 10 minutes, the daemon stops the retries. While PipeWire
+does not answer, retries pause; when it answers again, a new 10-minute
+retry period starts. (When the
+headset is docked, the periodic fallback check still tries to set a
+fallback output that changed.) If no fallback
+microphone exists, the daemon does not retry the input; when the headset is
+docked, the periodic fallback check sets a microphone that appears later.
+
+After a switch succeeds, the daemon does not set it again until one of
+these events occurs, so a manual choice stays until then:
+
+- the headset state changes, or the dock is disconnected
+- the base station is reset, or the USB session cannot be opened again
+- PipeWire is restarted
+- the best fallback output or microphone changes (for example, a monitor
+  is connected) while the headset is docked
+
+The daemon also checks that PipeWire answers (`pactl list short sinks`
+and `pw-cli ls Node`, 5-second limit each). It checks every 10 seconds, at once after a failed
+switch, and every poll while checks fail. When checks fail:
+
+1. After 3 failed checks in sequence, and at least 15 seconds of
+   failures, it does a USB reset of the base station. Then it sets the
+   devices for the headset state again.
+2. After at least 6 failed checks in total, and at least 30 seconds of
+   failures, it restarts the `wireplumber`, `pipewire` and
+   `pipewire-pulse` user services. After 5 seconds, it sets the default devices again (the
+   fallback devices if the dock is not connected).
+3. If the fault stays, these steps repeat. The minimum time between
+   restarts is 10 minutes, and each later wait is twice the one before
+   (20 minutes, 40 minutes), up to 1 hour. A good check sets it back to
+   10 minutes.
+
+While PipeWire does not answer, each poll can take up to about 12
+seconds, and up to about 40 seconds during a switch or a restart. The daemon detects dock changes more slowly during this time.
+
+**Note:** some apps (for example, Spotify) do not reconnect after a
+PipeWire restart. Restart these apps to get sound again.
+
 ## Acknowledgments
 
 Uses [eh-fifty](https://github.com/tdryer/eh-fifty) by Tom Dryer, a Python
