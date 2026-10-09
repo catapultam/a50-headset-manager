@@ -17,6 +17,8 @@ automatically switches the system's default audio sink and source based
 on whether the headset is being worn, docked, or disconnected.
 """
 
+import glob
+import os
 import re
 import subprocess
 import sys
@@ -52,11 +54,26 @@ DUMMY_SINK = "auto_null"
 #    retries the A50 sink without end, and PipeWire clients become too slow.
 #    A USB reset of the base station fixes this.
 # 2. PipeWire stops answering all clients, but its processes stay alive.
-#    A restart of the PipeWire services fixes this.
-# Step 1 (USB reset): HEALTH_FAILURE_LIMIT failed checks in sequence, during
-# at least REPAIR_MIN_SECONDS. Step 2 (PipeWire restart): at least
+#    A restart of the PipeWire services fixes this. The cause is not known.
+#    It starts some seconds after a headset state change, with no kernel
+#    error. It does not occur on each change, and a manual default sink
+#    change does not cause it. Without a repair, it stopped after about
+#    10 minutes (2026-09-03).
+# At the second failed check, the daemon saves the thread stacks of the
+# PipeWire services to STALL_LOG_DIR, to find the cause of failure 2 (at
+# most once in STALL_CAPTURE_INTERVAL). eu-stack stops each thread for a
+# short time (about 0.03 s for each service, without debuginfod).
+# Step 1: HEALTH_FAILURE_LIMIT failed checks in sequence, during at least
+# REPAIR_MIN_SECONDS. If the kernel logged an error for the base station in
+# the last KERNEL_ERROR_WINDOW, do a USB reset (failure 1). If not, restart
+# only WirePlumber: apps stay connected to PipeWire. Playback can stop for
+# a short time.
+# (A USB reset without a kernel error did not help, and the A50 devices
+# then failed in PipeWire.)
+# Step 2 (PipeWire restart): at least
 # 2 * HEALTH_FAILURE_LIMIT failed checks in total, and at least
-# 2 * REPAIR_MIN_SECONDS since the first failure. After a restart the cycle starts again. If the fault stays, the
+# 2 * REPAIR_MIN_SECONDS since the first failure, and at least
+# REPAIR_MIN_SECONDS since step 1. After a restart the cycle starts again. If the fault stays, the
 # minimum time between restarts is AUDIO_RESTART_COOLDOWN, and each later
 # wait is twice the one before, up to AUDIO_RESTART_COOLDOWN_MAX. A good check
 # resets it.
@@ -68,7 +85,13 @@ AUDIO_RESTART_COOLDOWN = 600  # seconds; minimum time between PipeWire restarts
 AUDIO_RESTART_COOLDOWN_MAX = 3600  # seconds
 AUDIO_RESTART_TIMEOUT = 30  # seconds; limit for the systemctl restart command
 AUDIO_SERVICES = ["wireplumber", "pipewire", "pipewire-pulse"]
+SESSION_MANAGER = "wireplumber"  # restarted alone in step 1 (no USB error)
 POST_RESTART_DELAY = 5  # seconds; wait after a restart before routing again
+KERNEL_ERROR_WINDOW = 60  # seconds of kernel log to search for USB errors
+STALL_LOG_DIR = os.path.expanduser("~/.local/state/a50-headset-manager")
+STALL_LOG_KEEP = 20  # number of stall logs to keep
+STALL_STACK_TIMEOUT = 5  # seconds; limit for each eu-stack call
+STALL_CAPTURE_INTERVAL = 600  # seconds; minimum time between captures
 
 # Retry of a sink or source switch that failed: first retry after
 # ROUTE_RETRY_MIN seconds, then the wait doubles up to ROUTE_RETRY_MAX.
@@ -426,13 +449,106 @@ def reset_dock_usb() -> bool:
     return result.returncode == 0
 
 
-def restart_audio_services() -> bool:
-    """Restart the PipeWire user services. Returns True on success."""
+def restart_audio_services(services: list[str] = AUDIO_SERVICES) -> bool:
+    """Restart the given audio user services. Returns True on success."""
     result = run_audio_cmd(
-        ["systemctl", "--user", "restart", *AUDIO_SERVICES],
+        ["systemctl", "--user", "restart", *services],
         check=True, timeout=AUDIO_RESTART_TIMEOUT,
     )
     return result is not None
+
+
+def dock_usb_paths() -> list[str]:
+    """Return the sysfs names of the base station (for example "5-1.1.2.2")."""
+    paths = []
+    for vendor_file in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+        dev_dir = os.path.dirname(vendor_file)
+        try:
+            with open(vendor_file) as f:
+                vendor = int(f.read(), 16)
+            with open(os.path.join(dev_dir, "idProduct")) as f:
+                product = int(f.read(), 16)
+        except (OSError, ValueError):
+            continue
+        if (vendor, product) == (DOCK_VENDOR_ID, DOCK_PRODUCT_ID):
+            paths.append(os.path.basename(dev_dir))
+    return paths
+
+
+def dock_usb_errors() -> bool:
+    """Return True if the kernel logged a USB error for the base station in
+    the last KERNEL_ERROR_WINDOW seconds (for example
+    "usb 5-1.1.2.2: 4:1: usb_set_interface failed (-110)")."""
+    paths = dock_usb_paths()
+    if not paths:
+        return False
+    result = run_audio_cmd(
+        ["journalctl", "-k", f"--since=-{KERNEL_ERROR_WINDOW}s",
+         "-o", "cat", "--no-pager"],
+    )
+    if result is None:
+        print("  Could not read the kernel log", flush=True)
+        return False
+    if not result.stdout and result.stderr:
+        # For example: the user cannot read the kernel log
+        print(f"  Kernel log: {result.stderr.strip()}", flush=True)
+        return False
+    for line in result.stdout.splitlines():
+        if not any(f" {p}:" in line for p in paths):
+            continue
+        line = line.lower()
+        if "fail" in line or "error" in line or "(-" in line:
+            return True
+    return False
+
+
+# Writes the threads (ID, name, kernel wait point, state) and the stacks of
+# each audio service. Runs in the background, so a slow eu-stack does not
+# stop the daemon. DEBUGINFOD_URLS is cleared: a download of debug data while
+# a thread is stopped would make the stall longer. If a thread waits in the
+# kernel (state D), eu-stack is not used: it cannot stop that thread, and
+# its stop signal can stay pending. SIGCONT after eu-stack removes a
+# pending stop signal.
+_STALL_CAPTURE_SCRIPT = """
+for svc in "$@"; do
+    pid=$(systemctl --user show -p MainPID --value "$svc")
+    echo "== $svc (pid $pid)"
+    [ -n "$pid" ] && [ "$pid" != 0 ] || continue
+    blocked=no
+    for t in /proc/"$pid"/task/*; do
+        state=$(sed 's/.*) //' "$t/stat" | cut -d' ' -f1)
+        [ "$state" = D ] && blocked=yes
+        echo "${t##*/} $(cat "$t/comm") $(cat "$t/wchan") $state"
+    done
+    if [ "$blocked" = yes ]; then
+        echo "A thread is in state D: no stacks"
+        continue
+    fi
+    DEBUGINFOD_URLS= timeout -k 1 %d eu-stack -p "$pid" 2>&1
+    kill -CONT "$pid" 2>/dev/null
+done
+""" % STALL_STACK_TIMEOUT
+
+
+def capture_stall_state():
+    """Save the state of the audio services to a new file in STALL_LOG_DIR.
+    Keeps the newest STALL_LOG_KEEP files."""
+    try:
+        os.makedirs(STALL_LOG_DIR, exist_ok=True)
+        old = sorted(glob.glob(os.path.join(STALL_LOG_DIR, "stall-*.txt")))
+        for path in old[:max(0, len(old) - STALL_LOG_KEEP + 1)]:
+            os.remove(path)
+        path = os.path.join(
+            STALL_LOG_DIR, time.strftime("stall-%Y%m%d-%H%M%SZ.txt", time.gmtime()))
+        with open(path, "w") as out:
+            subprocess.Popen(
+                ["sh", "-c", _STALL_CAPTURE_SCRIPT, "sh", *AUDIO_SERVICES],
+                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        print(f"  Saving audio service state to {path}", flush=True)
+    except OSError as e:
+        print(f"  Could not save audio service state: {e}", flush=True)
 
 
 def try_connect_device() -> Device | None:
@@ -506,7 +622,8 @@ def main():
     - HDMI hotplug events (periodic fallback re-evaluation)
 
     It also retries a failed sink or source switch, and repairs a stuck
-    audio path (USB reset, then PipeWire restart). See the constants above.
+    audio path (WirePlumber restart or USB reset, then PipeWire restart).
+    See the constants above.
     """
     print("A50 Audio Switcher", flush=True)
 
@@ -540,12 +657,15 @@ def main():
     route_retry_delay = ROUTE_RETRY_MIN
     route_next_try = 0.0  # time.monotonic() of the next attempt
     route_deadline = 0.0  # time.monotonic() after which retries stop
+    route_hold_until = 0.0  # no routing before this time (after a restart)
 
     # Audio path health (see HEALTH_CHECK_INTERVAL)
     health_next_check = 0.0  # time.monotonic() of the next health check
     health_failures = 0
     health_fail_since = 0.0  # time.monotonic() of the first failed check
-    usb_reset_done = False  # step 1 done in this repair cycle
+    step1_done = False  # step 1 done in this repair cycle
+    step1_time = 0.0  # time.monotonic() of step 1
+    last_capture = None  # time.monotonic() of the last stall capture
     last_audio_restart = None  # time.monotonic() of the last PipeWire restart
     restart_cooldown = AUDIO_RESTART_COOLDOWN
     restart_unresolved = False  # no good check since the last restart
@@ -625,6 +745,8 @@ def main():
         if route_pending is None:
             return
         now = time.monotonic()
+        if now < route_hold_until:
+            return  # just after a restart; also for a forced switch
         if not force and (health_failures or now < route_next_try):
             return
         if now > route_deadline:
@@ -654,11 +776,27 @@ def main():
         route_retry_delay = min(route_retry_delay * 2, ROUTE_RETRY_MAX)
         health_next_check = 0.0
 
+    def reroute_after_restart():
+        """Request the default devices again after a restart. Without a known
+        status, use the fallback if the dock is not connected."""
+        nonlocal route_next_try, route_hold_until
+        if device is None:
+            target = "fallback"
+        else:
+            target = route_pending
+            if target is None and last_status is not None:
+                target = desired_route(last_status)
+        if target is not None:
+            request_route(target)
+            # Give PipeWire time to list its devices again
+            route_hold_until = time.monotonic() + POST_RESTART_DELAY
+            route_next_try = route_hold_until
+
     def check_audio_health():
         """Run a health check when due. Repair the audio path after repeated
         failures."""
         nonlocal device, last_status, health_failures, health_next_check
-        nonlocal health_fail_since, usb_reset_done
+        nonlocal health_fail_since, step1_done, step1_time, last_capture
         nonlocal last_audio_restart, restart_cooldown, restart_unresolved
         nonlocal route_next_try, route_deadline
         now = time.monotonic()
@@ -672,11 +810,12 @@ def main():
                 print("Audio path healthy again", flush=True)
                 if route_pending is not None:
                     # Retries were paused; give the pending routing a new
-                    # retry period, starting now.
-                    route_next_try = now
+                    # retry period, starting now (or after the wait that
+                    # follows a restart).
+                    route_next_try = max(now, route_hold_until)
                     route_deadline = now + ROUTE_RETRY_LIMIT
             health_failures = 0
-            usb_reset_done = False
+            step1_done = False
             restart_cooldown = AUDIO_RESTART_COOLDOWN
             restart_unresolved = False
             return
@@ -687,23 +826,41 @@ def main():
         print(f"Audio health check failed ({health_failures})", flush=True)
         failing_for = now - health_fail_since
 
-        if (not usb_reset_done and health_failures >= HEALTH_FAILURE_LIMIT
-                and failing_for >= REPAIR_MIN_SECONDS):
-            # Step 1: USB reset of the base station. Close our session first;
-            # the main loop opens a new one and routes audio again.
-            print("Repair: USB reset of the base station", flush=True)
-            usb_reset_done = True
-            if device is not None:
-                try:
-                    device.close()
-                except Exception:
-                    pass
-                device = None
-            last_status = None
-            reset_dock_usb()
+        if health_failures == 2 and (
+                last_capture is None
+                or now - last_capture >= STALL_CAPTURE_INTERVAL):
+            last_capture = now
+            capture_stall_state()
 
-        elif (usb_reset_done and health_failures >= 2 * HEALTH_FAILURE_LIMIT
-                and failing_for >= 2 * REPAIR_MIN_SECONDS):
+        if (not step1_done and health_failures >= HEALTH_FAILURE_LIMIT
+                and failing_for >= REPAIR_MIN_SECONDS):
+            step1_done = True
+            if dock_usb_errors():
+                # Step 1a: USB reset of the base station. Close our session
+                # first; the main loop opens a new one and routes audio again.
+                print("Repair: USB reset of the base station", flush=True)
+                if device is not None:
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+                    device = None
+                last_status = None
+                reset_dock_usb()
+            else:
+                # Step 1b: restart WirePlumber only. Then set the default
+                # devices again (WirePlumber can restore an older default).
+                print("Repair: restart of WirePlumber", flush=True)
+                if restart_audio_services([SESSION_MANAGER]):
+                    print("  WirePlumber restarted", flush=True)
+                reroute_after_restart()
+            # Measure the wait for step 2 from the end of step 1 (the repair
+            # can take up to 30 s)
+            step1_time = time.monotonic()
+
+        elif (step1_done and health_failures >= 2 * HEALTH_FAILURE_LIMIT
+                and failing_for >= 2 * REPAIR_MIN_SECONDS
+                and now - step1_time >= REPAIR_MIN_SECONDS):
             # Step 2: restart PipeWire, at most once per cooldown period
             if (last_audio_restart is not None
                     and now - last_audio_restart < restart_cooldown):
@@ -721,19 +878,8 @@ def main():
             # Start a new repair cycle, also when systemctl failed or timed
             # out (systemd can still finish the restart).
             health_failures = 0
-            usb_reset_done = False
-            # Set the default devices again. Without a known status, use the
-            # fallback if the dock is not connected.
-            if device is None:
-                target = "fallback"
-            else:
-                target = route_pending
-                if target is None and last_status is not None:
-                    target = desired_route(last_status)
-            if target is not None:
-                request_route(target)
-                # Give PipeWire time to list its devices again
-                route_next_try = time.monotonic() + POST_RESTART_DELAY
+            step1_done = False
+            reroute_after_restart()
 
     def desired_route(status):
         """Return the routing target for a headset status, or None."""
@@ -831,6 +977,9 @@ def main():
                 print("Headset active - switching to A50", flush=True)
             elif target == "fallback":
                 print("Headset docked - switching to fallback:", flush=True)
+            # Log the raw status bits. This helps to find false readings.
+            print(f"  Status: on={status.is_on} docked={status.is_docked}",
+                  flush=True)
             # A new status replaces any older pending routing. The first
             # attempt runs even while the audio path is unhealthy.
             request_route(target)

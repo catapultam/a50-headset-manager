@@ -127,7 +127,7 @@ these events occurs, so a manual choice stays until then:
 
 - the headset state changes, or the dock is disconnected
 - the base station is reset, or the USB session cannot be opened again
-- PipeWire is restarted
+- WirePlumber or PipeWire is restarted
 - the best fallback output or microphone changes (for example, a monitor
   is connected) while the headset is docked
 
@@ -135,20 +135,37 @@ The daemon also checks that PipeWire answers (`pactl list short sinks`
 and `pw-cli ls Node`, 5-second limit each). It checks every 10 seconds, at once after a failed
 switch, and every poll while checks fail. When checks fail:
 
-1. After 3 failed checks in sequence, and at least 15 seconds of
-   failures, it does a USB reset of the base station. Then it sets the
-   devices for the headset state again.
-2. After at least 6 failed checks in total, and at least 30 seconds of
-   failures, it restarts the `wireplumber`, `pipewire` and
-   `pipewire-pulse` user services. After 5 seconds, it sets the default devices again (the
+1. At the second failed check, it saves the threads and stacks of the
+   `wireplumber`, `pipewire` and `pipewire-pulse` services to
+   `~/.local/state/a50-headset-manager/stall-*.txt` (at most once in 10
+   minutes; the newest 20 files are kept). These files help to find the
+   cause of a stall. The stacks need `eu-stack` (elfutils). `eu-stack`
+   stops the threads of each service for a short time. If a thread of a
+   service waits in the kernel (state D), the daemon saves no stacks for
+   that service. File names use UTC.
+2. After 3 failed checks in sequence, and at least 15 seconds of
+   failures:
+   - If the kernel logged a USB error for the base station in the last
+     60 seconds, it does a USB reset of the base station. Then it sets
+     the devices for the headset state again. To read the kernel log,
+     the user must be in the `wheel`, `adm` or `systemd-journal` group.
+     If the user cannot read it, the daemon never does the USB reset. The
+     log then shows "Kernel log:" and the error.
+   - If not, it restarts only the `wireplumber` user service, and then
+     sets the default devices again after 5 seconds. Apps stay connected. Playback can
+     stop for a short time.
+3. After at least 6 failed checks in total, at least 30 seconds of
+   failures, and at least 15 seconds after step 2, it restarts the
+   `wireplumber`, `pipewire` and `pipewire-pulse` user services. After 5 seconds, it sets the default devices again (the
    fallback devices if the dock is not connected).
-3. If the fault stays, these steps repeat. The minimum time between
+4. If the fault stays, these steps repeat. The minimum time between
    restarts is 10 minutes, and each later wait is twice the one before
    (20 minutes, 40 minutes), up to 1 hour. A good check sets it back to
    10 minutes.
 
 While PipeWire does not answer, each poll can take up to about 12
-seconds, and up to about 40 seconds during a switch or a restart. The daemon detects dock changes more slowly during this time.
+seconds, and up to about 45 seconds during a restart. A switch in the
+same poll adds up to about 30 seconds. The daemon detects dock changes more slowly during this time.
 
 **Note:** some apps (for example, Spotify) do not reconnect after a
 PipeWire restart. Restart these apps to get sound again.
