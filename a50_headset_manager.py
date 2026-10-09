@@ -22,7 +22,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from usb.core import USBError
@@ -59,10 +61,12 @@ DUMMY_SINK = "auto_null"
 #    error. It does not occur on each change, and a manual default sink
 #    change does not cause it. Without a repair, it stopped after about
 #    10 minutes (2026-09-03).
-# At the second failed check, the daemon saves the thread stacks of the
-# PipeWire services to STALL_LOG_DIR, to find the cause of failure 2 (at
-# most once in STALL_CAPTURE_INTERVAL). eu-stack stops each thread for a
-# short time (about 0.03 s for each service, without debuginfod).
+# At the second failed check, the daemon saves a stall log to STALL_LOG_DIR,
+# to find the cause of failure 2. It does this at most once in
+# STALL_CAPTURE_INTERVAL. The stall log contains the recorder, the threads and
+# stacks of the PipeWire services, the recent logs, pw-dump, and the ALSA and
+# USB audio streams. eu-stack stops each thread for a short time (about
+# 0.03 s for each service, without debuginfod).
 # Step 1: HEALTH_FAILURE_LIMIT failed checks in sequence, during at least
 # REPAIR_MIN_SECONDS. If the kernel logged an error for the base station in
 # the last KERNEL_ERROR_WINDOW, do a USB reset (failure 1). If not, restart
@@ -92,6 +96,9 @@ STALL_LOG_DIR = os.path.expanduser("~/.local/state/a50-headset-manager")
 STALL_LOG_KEEP = 20  # number of stall logs to keep
 STALL_STACK_TIMEOUT = 5  # seconds; limit for each eu-stack call
 STALL_CAPTURE_INTERVAL = 600  # seconds; minimum time between captures
+STALL_LOG_WINDOW = 180  # seconds of journal to copy into a stall log
+RECORD_LINES = 300  # lines in the recorder (about one each second)
+HEALTH_SLOW_SECONDS = 2  # log a health check that passes but takes longer
 
 # Retry of a sink or source switch that failed: first retry after
 # ROUTE_RETRY_MIN seconds, then the wait doubles up to ROUTE_RETRY_MAX.
@@ -502,37 +509,194 @@ def dock_usb_errors() -> bool:
     return False
 
 
-# Writes the threads (ID, name, kernel wait point, state) and the stacks of
-# each audio service. Runs in the background, so a slow eu-stack does not
-# stop the daemon. DEBUGINFOD_URLS is cleared: a download of debug data while
-# a thread is stopped would make the stall longer. If a thread waits in the
-# kernel (state D), eu-stack is not used: it cannot stop that thread, and
-# its stop signal can stay pending. SIGCONT after eu-stack removes a
-# pending stop signal.
+# Writes the threads and the stacks of each audio service. Runs in the
+# background, so a slow eu-stack does not stop the daemon. DEBUGINFOD_URLS is
+# cleared: a download of debug data while a thread is stopped would make the
+# stall longer. eu-stack cannot stop a thread that waits in the kernel
+# (state D), and its stop signal can then stay pending. For this reason, if
+# the second thread list has a thread in state D, the script does not use
+# eu-stack.
+# SIGCONT after eu-stack removes a pending stop signal.
+#
+# Each thread line: ID, name, kernel wait point, state, user and system CPU
+# time (clock ticks). The thread list is written two times, 1 s apart: a
+# thread that uses CPU and a thread that waits have the same wait point, but
+# only the first has a CPU time that increases.
+#
+# Then the script writes the last STALL_LOG_WINDOW seconds of the kernel log
+# and of the audio service and daemon logs. It removes the many "split lock"
+# lines from the kernel log. Then it writes the pw-dump output. Only pw-dump
+# needs PipeWire. The ALSA and USB audio stream data is last. A read of an
+# ALSA status file can wait for a kernel lock (for example, during a USB
+# hang). timeout cannot stop a read in state D. Then only this last part of
+# the stall log is lost.
 _STALL_CAPTURE_SCRIPT = """
+threads() {
+    blocked=no
+    for t in /proc/"$1"/task/*; do
+        set -- $(sed 's/.*) //' "$t/stat")
+        [ "$1" = D ] && blocked=yes
+        echo "${t##*/} $(cat "$t/comm") $(cat "$t/wchan") $1 utime=${12} stime=${13}"
+    done
+}
 for svc in "$@"; do
     pid=$(systemctl --user show -p MainPID --value "$svc")
     echo "== $svc (pid $pid)"
     [ -n "$pid" ] && [ "$pid" != 0 ] || continue
-    blocked=no
-    for t in /proc/"$pid"/task/*; do
-        state=$(sed 's/.*) //' "$t/stat" | cut -d' ' -f1)
-        [ "$state" = D ] && blocked=yes
-        echo "${t##*/} $(cat "$t/comm") $(cat "$t/wchan") $state"
-    done
+    threads "$pid"
+    sleep 1
+    echo "-- 1 s later:"
+    threads "$pid"
     if [ "$blocked" = yes ]; then
         echo "A thread is in state D: no stacks"
         continue
     fi
-    DEBUGINFOD_URLS= timeout -k 1 %d eu-stack -p "$pid" 2>&1
+    DEBUGINFOD_URLS= timeout -k 1 %(stack)d eu-stack -p "$pid" 2>&1
     kill -CONT "$pid" 2>/dev/null
 done
-""" % STALL_STACK_TIMEOUT
+echo "== Kernel log"
+journalctl -k --since=-%(window)ds -o short-precise --no-pager | grep -v 'split lock'
+echo "== Audio service log"
+journalctl --user -u wireplumber -u pipewire -u pipewire-pulse \\
+    -u a50-headset-manager \\
+    --since=-%(window)ds -o short-precise --no-pager
+echo "== pw-dump"
+timeout -k 1 5 pw-dump 2>&1 || echo "pw-dump failed or timed out"
+echo "== Open ALSA streams"
+for f in /proc/asound/card*/pcm*/sub0/status; do
+    [ -e "$f" ] || continue
+    status=$(timeout -k 1 2 cat "$f")
+    case $? in
+        0) ;;
+        124) echo "-- $f: read timed out"; continue ;;
+        *) continue ;;
+    esac
+    [ "${status#closed}" != "$status" ] && continue
+    card=$(dirname "$(dirname "$(dirname "$f")")")
+    echo "-- $(cat "$card/id") ${f#$card/}"
+    echo "$status"
+done
+echo "== USB audio streams"
+for f in /proc/asound/card*/stream*; do
+    [ -e "$f" ] || continue
+    timeout -k 1 2 cat "$f"
+    [ $? = 124 ] && echo "-- $f: read timed out"
+done
+""" % {"stack": STALL_STACK_TIMEOUT, "window": STALL_LOG_WINDOW}
+
+
+# The recorder: the last RECORD_LINES lines of the daemon events. These are
+# the headset status and the open ALSA streams, routing events and health
+# check times. The recorder is in memory only. A stall log starts with it, to
+# show the time before the stall.
+_recorder = deque(maxlen=RECORD_LINES)
+
+
+def record(text: str):
+    """Add a line with the local date and time to the recorder."""
+    now = time.time()
+    stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(now))
+    _recorder.append(f"{stamp}.{int(now % 1 * 1000):03d} {text}")
+
+
+# A read of an ALSA status file can wait for a kernel lock without a time
+# limit (for example, while a USB audio device hangs). Nothing can stop a
+# process in this state until its read ends. For this reason, a background
+# thread starts a child process that reads the files. If the child does not
+# end in STREAM_READ_TIMEOUT, the thread kills it. A child in state D ends
+# only when its read ends. No new child starts until it ends. The main loop
+# uses stream_summary(): it gives the last good result, its age, the wait
+# time and the last error.
+STREAM_READ_TIMEOUT = 2  # seconds
+_streams = ("not read yet", time.monotonic())  # last good result and time
+_streams_wait = None  # start of a read that did not end in time, or None
+_streams_error = None  # the last read error, until a read is good again
+
+
+def parse_stream_states(output: str) -> str:
+    """Make one line from the output of grep -H "" on the ALSA id and status
+    files, for example "A50/pcm0p RUNNING hw_ptr=1200 pid=997288". Only the
+    first substream (sub0) of each PCM is read."""
+    ids = {}
+    status = {}
+    for line in output.splitlines():
+        path, _, value = line.partition(":")
+        if path.endswith("/id"):
+            ids[os.path.dirname(path)] = value.strip()
+        elif path.endswith("/status"):
+            status.setdefault(path, []).append(value)
+    states = []
+    for path in sorted(status):
+        text = "\n".join(status[path])
+        if text.startswith("closed"):
+            continue
+        card_dir = path.split("/pcm")[0]
+        pcm = path[len(card_dir) + 1:].split("/")[0]
+        fields = dict(
+            (k.strip(), v.strip()) for k, _, v in
+            (line.partition(":") for line in text.splitlines()) if v)
+        states.append(f"{ids.get(card_dir, card_dir)}/{pcm} "
+                      f"{fields.get('state', '?')} "
+                      f"hw_ptr={fields.get('hw_ptr', '?')} "
+                      f"pid={fields.get('owner_pid', '?')}")
+    return "; ".join(states) or "none"
+
+
+def _read_streams_forever():
+    global _streams, _streams_wait, _streams_error
+    child = None
+    while True:
+        try:
+            if child is None or child.poll() is not None:
+                _streams_wait = None
+                started = time.monotonic()
+                paths = (glob.glob("/proc/asound/card*/id")
+                         + glob.glob("/proc/asound/card*/pcm*/sub0/status"))
+                child = subprocess.Popen(
+                    ["grep", "-H", "", *paths],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True,
+                    start_new_session=True,
+                )
+                try:
+                    output, _ = child.communicate(timeout=STREAM_READ_TIMEOUT)
+                    _streams = (parse_stream_states(output), time.monotonic())
+                    _streams_wait = None
+                    _streams_error = None
+                    child = None
+                except subprocess.TimeoutExpired:
+                    _streams_wait = started
+                    child.kill()
+        except Exception as e:
+            _streams_error = repr(e)
+            _streams_wait = None
+        time.sleep(1)
+
+
+def start_stream_reader():
+    """Start the background thread that reads the ALSA streams."""
+    threading.Thread(target=_read_streams_forever, daemon=True).start()
+
+
+def stream_summary() -> str:
+    """Return the last good result of the stream reader, with its age. Add
+    the time that the current read waits (if a read does not end) and the
+    last read error (if the last read failed)."""
+    text, when = _streams
+    now = time.monotonic()
+    summary = f"{text} (age {now - when:.1f} s)"
+    wait = _streams_wait
+    if wait is not None:
+        summary += f"; read waits for {now - wait:.0f} s"
+    error = _streams_error
+    if error is not None:
+        summary += f"; read failed: {error}"
+    return summary
 
 
 def capture_stall_state():
-    """Save the state of the audio services to a new file in STALL_LOG_DIR.
-    Keeps the newest STALL_LOG_KEEP files."""
+    """Save the recorder and the state of the audio services to a new file in
+    STALL_LOG_DIR. Keeps the newest STALL_LOG_KEEP files."""
     try:
         os.makedirs(STALL_LOG_DIR, exist_ok=True)
         old = sorted(glob.glob(os.path.join(STALL_LOG_DIR, "stall-*.txt")))
@@ -541,6 +705,9 @@ def capture_stall_state():
         path = os.path.join(
             STALL_LOG_DIR, time.strftime("stall-%Y%m%d-%H%M%SZ.txt", time.gmtime()))
         with open(path, "w") as out:
+            out.write("== Recorder (last lines before the stall)\n")
+            out.writelines(line + "\n" for line in _recorder)
+        with open(path, "a") as out:
             subprocess.Popen(
                 ["sh", "-c", _STALL_CAPTURE_SCRIPT, "sh", *AUDIO_SERVICES],
                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
@@ -626,6 +793,7 @@ def main():
     See the constants above.
     """
     print("A50 Audio Switcher", flush=True)
+    start_stream_reader()
 
     device = None
     last_status = None
@@ -674,6 +842,8 @@ def main():
         """Mark routing to target (both halves) as pending, due now."""
         nonlocal route_pending, sink_pending, source_pending
         nonlocal route_retry_delay, route_next_try, route_deadline
+        record(f"routing to {target} requested" if target is not None
+               else "routing cleared")
         route_pending = target
         sink_pending = source_pending = target is not None
         route_retry_delay = ROUTE_RETRY_MIN
@@ -751,6 +921,7 @@ def main():
             return
         if now > route_deadline:
             print(f"  Routing to {route_pending}: retries stopped", flush=True)
+            record(f"routing to {route_pending}: retries stopped")
             route_pending = None
             return
 
@@ -769,9 +940,11 @@ def main():
                 source_pending = not switch_fallback_source()
 
         if not sink_pending and not source_pending:
+            record(f"routing to {route_pending} done")
             route_pending = None
             return
         print(f"  Routing to {route_pending} incomplete; will retry", flush=True)
+        record(f"routing to {route_pending} incomplete")
         route_next_try = time.monotonic() + route_retry_delay
         route_retry_delay = min(route_retry_delay * 2, ROUTE_RETRY_MAX)
         health_next_check = 0.0
@@ -802,8 +975,13 @@ def main():
         now = time.monotonic()
         if not health_failures and now < health_next_check:
             return
+        start = time.monotonic()
         healthy = audio_healthy()
         now = time.monotonic()
+        record(f"health check {'passed' if healthy else 'failed'} "
+               f"in {now - start:.1f} s")
+        if healthy and now - start > HEALTH_SLOW_SECONDS:
+            print(f"Slow audio health check: {now - start:.1f} s", flush=True)
         health_next_check = now + HEALTH_CHECK_INTERVAL
         if healthy:
             if health_failures:
@@ -894,6 +1072,8 @@ def main():
         # Try to connect to USB dock if not connected
         if device is None:
             device = try_connect_device()
+            if not device:
+                record(f"no dock; streams: {stream_summary()}")
             if device:
                 print("Dock connected", flush=True)
                 # Reset backoff on successful connection
@@ -929,6 +1109,7 @@ def main():
             device = try_connect_device()
             if device is None:
                 print("Periodic refresh: dock unreachable, retrying", flush=True)
+                record("periodic refresh: dock unreachable")
                 last_status = None
                 time.sleep(backoff_seconds)
                 continue
@@ -940,6 +1121,7 @@ def main():
         except (USBError, DeviceNotConnected) as e:
             # USB dock disconnected or communication error
             print(f"Dock disconnected ({type(e).__name__})", flush=True)
+            record(f"dock disconnected ({type(e).__name__})")
             # Clean up device and reattach kernel driver
             try:
                 device.close()
@@ -959,6 +1141,7 @@ def main():
         except Exception as e:
             # Unexpected error - also disconnect and retry
             print(f"Unexpected error: {e}", flush=True)
+            record(f"unexpected error: {e}")
             try:
                 device.close()
             except Exception:
@@ -967,6 +1150,9 @@ def main():
             last_status = None
             time.sleep(backoff_seconds)
             continue
+
+        record(f"status on={status.is_on} docked={status.is_docked}; "
+               f"streams: {stream_summary()}")
 
         # === Handle headset status changes ===
         poll_counter += 1

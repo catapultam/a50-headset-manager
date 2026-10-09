@@ -135,14 +135,51 @@ The daemon also checks that PipeWire answers (`pactl list short sinks`
 and `pw-cli ls Node`, 5-second limit each). It checks every 10 seconds, at once after a failed
 switch, and every poll while checks fail. When checks fail:
 
-1. At the second failed check, it saves the threads and stacks of the
-   `wireplumber`, `pipewire` and `pipewire-pulse` services to
+1. At the second failed check, it saves a stall log to
    `~/.local/state/a50-headset-manager/stall-*.txt` (at most once in 10
-   minutes; the newest 20 files are kept). These files help to find the
-   cause of a stall. The stacks need `eu-stack` (elfutils). `eu-stack`
-   stops the threads of each service for a short time. If a thread of a
-   service waits in the kernel (state D), the daemon saves no stacks for
-   that service. File names use UTC.
+   minutes; the newest 20 files are kept; file names use UTC). These files
+   help to find the cause of a stall. A stall log contains:
+   - The recorder: the last 300 lines of daemon events (about 5 minutes
+     while the dock is connected). These are the headset status, the open
+     ALSA streams (state, position and owner process, from
+     `/proc/asound`), routing events and health check times. The daemon
+     keeps the recorder in memory. A background thread starts a child
+     process that reads the ALSA streams. If the child does not end in
+     2 seconds, the thread kills it. No new child starts until it ends.
+     For this reason, a read that waits for a kernel lock does not stop
+     the daemon. Each status line shows the last good stream data and its
+     age. If a read does not end, the line also shows how long the read
+     waits. If a read failed, the line also shows the error.
+   - The threads (kernel wait point, state, CPU time) of the
+     `wireplumber`, `pipewire` and `pipewire-pulse` services, two times
+     with 1 second between them, and their stacks. The stacks need
+     `eu-stack` (elfutils). `eu-stack` stops the threads of each service
+     for a short time. If a thread of a service waits in the kernel
+     (state D), the daemon saves no stacks for that service.
+   - The last 3 minutes of the kernel log (without "split lock" lines)
+     and of the audio service and daemon logs.
+   - The `pw-dump` output (if PipeWire answers in 5 seconds).
+   - The open ALSA streams and the USB audio streams at the time of the
+     stall. These are last: if a read waits for a kernel lock, only this
+     part is lost.
+
+   A stall log is about 0.5 MB, most of it from `pw-dump`.
+
+   A health check that passes but takes more than 2 seconds is written to
+   the log as "Slow audio health check".
+
+   For more data, make PipeWire log ALSA stream and node state changes.
+   This adds few lines to the journal. Put this in
+   `~/.config/systemd/user/pipewire.service.d/50-log-topics.conf`:
+
+   ```ini
+   [Service]
+   Environment=PIPEWIRE_DEBUG=2,spa.alsa:3,pw.node:3
+   ```
+
+   Then run `systemctl --user daemon-reload`. The setting starts at the
+   next PipeWire start. To start it now without a restart, run
+   `pw-metadata -n settings 0 log.level '2,spa.alsa:3,pw.node:3'`.
 2. After 3 failed checks in sequence, and at least 15 seconds of
    failures:
    - If the kernel logged a USB error for the base station in the last
